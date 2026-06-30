@@ -225,6 +225,73 @@ AIRPORT_CODES = {
 AIRPORT_CODES_URL = "https://raw.githubusercontent.com/cloudflare/cf-ui/master/packages/colo-config/src/data.json"
 AIRPORT_CODES_FILE = "airport_codes.json"
 
+COUNTRY_CODE_BY_NAME = {
+    "新加坡": "SG",
+    "中国香港": "HK",
+    "香港": "HK",
+    "日本": "JP",
+    "韩国": "KR",
+    "美国": "US",
+    "德国": "DE",
+    "英国": "GB",
+    "荷兰": "NL",
+    "芬兰": "FI",
+    "瑞典": "SE",
+}
+
+
+def country_code_to_flag(country_code):
+    code = (country_code or "").strip().upper()
+    if len(code) != 2 or not code.isalpha():
+        return ""
+    return "".join(chr(127397 + ord(char)) for char in code)
+
+
+def get_country_code_for_row(row):
+    region_code = (row.get("region_code") or "").strip().upper()
+    airport_info = AIRPORT_CODES.get(region_code, {})
+    country_name = (row.get("country") or airport_info.get("country") or "").strip()
+    return COUNTRY_CODE_BY_NAME.get(country_name, "")
+
+
+def build_geo_prefix_for_row(row):
+    region_code = (row.get("region_code") or "").strip().upper()
+    airport_info = AIRPORT_CODES.get(region_code, {})
+    location_name = (row.get("region_name") or airport_info.get("name") or "").strip()
+    if location_name == "未知地区":
+        location_name = ""
+    country_code = get_country_code_for_row(row)
+    flag = country_code_to_flag(country_code)
+    if not location_name:
+        return ""
+    if flag:
+        return f"{flag}{location_name}"
+    return location_name
+
+
+def build_worker_upload_items(best_ips):
+    items = []
+    for index, ip_info in enumerate(best_ips, start=1):
+        region_code = (ip_info.get("region_code") or "").strip().upper()
+        airport_info = AIRPORT_CODES.get(region_code, {})
+        base_name = f"优选节点-{index:02d}"
+        prefix = build_geo_prefix_for_row(ip_info)
+        name = f"{prefix}-{base_name}" if prefix else base_name
+        items.append({
+            "ip": ip_info["ip"],
+            "port": ip_info["port"],
+            "name": name,
+            "regionCode": region_code,
+            "country": ip_info.get("country") or airport_info.get("country", ""),
+            "city": ip_info.get("region_name") or airport_info.get("name", ""),
+            "sourceType": "preferred",
+        })
+    return items
+
+
+def build_github_upload_lines(best_ips):
+    return [f"{item['ip']}:{item['port']}#{item['name']}" for item in build_worker_upload_items(best_ips)]
+
 # Cloudflare IP列表URL和文件
 CLOUDFLARE_IP_URL = "https://www.cloudflare.com/ips-v4/"
 CLOUDFLARE_IP_FILE = "Cloudflare.txt"
@@ -2960,7 +3027,7 @@ def upload_to_cloudflare_api(result_file="result.csv"):
                         latency_val = latency if latency else 'N/A'
                         
                         # 获取地区中文名称
-                        region_name = '未知地区'
+                        region_name = ''
                         if region_code and region_code in AIRPORT_CODES:
                             region_name = AIRPORT_CODES[region_code].get('name', region_code)
                         elif region_code:
@@ -2972,7 +3039,8 @@ def upload_to_cloudflare_api(result_file="result.csv"):
                             'speed': speed_val,
                             'latency': latency_val,
                             'region_code': region_code,
-                            'region_name': region_name
+                            'region_name': region_name,
+                            'country': AIRPORT_CODES.get(region_code, {}).get('country', '')
                         })
                     except ValueError:
                         continue
@@ -3048,18 +3116,7 @@ def upload_to_cloudflare_api(result_file="result.csv"):
         
         # 构建批量上报数据
         print("\n🚀 开始批量上报优选IP...")
-        batch_data = []
-        for ip_info in best_ips[:upload_count]:
-            # 构建节点名称：地区名-速度MB/s
-            region_name = ip_info.get('region_name', '未知地区')
-            speed = ip_info['speed']
-            name = f"{region_name}-{speed:.2f}MB/s"
-            
-            batch_data.append({
-                "ip": ip_info['ip'],
-                "port": ip_info['port'],
-                "name": name
-            })
+        batch_data = build_worker_upload_items(best_ips[:upload_count])
         
         # 发送批量POST请求
         use_curl_fallback = False
@@ -3329,7 +3386,7 @@ def upload_to_github(result_file="result.csv"):
                         latency_val = latency if latency else 'N/A'
                         
                         # 获取地区中文名称
-                        region_name = '未知地区'
+                        region_name = ''
                         if region_code and region_code in AIRPORT_CODES:
                             region_name = AIRPORT_CODES[region_code].get('name', region_code)
                         elif region_code:
@@ -3341,7 +3398,8 @@ def upload_to_github(result_file="result.csv"):
                             'speed': speed_val,
                             'latency': latency_val,
                             'region_code': region_code,
-                            'region_name': region_name
+                            'region_name': region_name,
+                            'country': AIRPORT_CODES.get(region_code, {}).get('country', '')
                         })
                     except ValueError:
                         continue
@@ -3386,14 +3444,7 @@ def upload_to_github(result_file="result.csv"):
         
         # 格式化数据为换行符分隔的格式（包含注释，和Cloudflare Workers API一样）
         print("\n🚀 开始上传到 GitHub 仓库...")
-        content_lines = []
-        for ip_info in best_ips[:upload_count]:
-            # 构建节点名称：地区名-速度MB/s（和Cloudflare Workers API一样）
-            region_name = ip_info.get('region_name', '未知地区')
-            speed = ip_info['speed']
-            name = f"{region_name}-{speed:.2f}MB/s"
-            # 格式：IP:端口#地区名-速度MB/s（井号前后无空格）
-            content_lines.append(f"{ip_info['ip']}:{ip_info['port']}#{name}")
+        content_lines = build_github_upload_lines(best_ips[:upload_count])
         
         # 使用换行符连接所有行
         content = '\n'.join(content_lines)
@@ -3702,7 +3753,7 @@ def upload_to_cloudflare_api_cli(result_file="result.csv", worker_domain=None, u
                         latency_val = latency if latency else 'N/A'
                         
                         # 获取地区中文名称
-                        region_name = '未知地区'
+                        region_name = ''
                         if region_code and region_code in AIRPORT_CODES:
                             region_name = AIRPORT_CODES[region_code].get('name', region_code)
                         elif region_code:
@@ -3714,7 +3765,8 @@ def upload_to_cloudflare_api_cli(result_file="result.csv", worker_domain=None, u
                             'speed': speed_val,
                             'latency': latency_val,
                             'region_code': region_code,
-                            'region_name': region_name
+                            'region_name': region_name,
+                            'country': AIRPORT_CODES.get(region_code, {}).get('country', '')
                         })
                     except ValueError:
                         continue
@@ -3760,18 +3812,7 @@ def upload_to_cloudflare_api_cli(result_file="result.csv", worker_domain=None, u
         
         # 构建批量上报数据
         print("\n🚀 开始批量上报优选IP...")
-        batch_data = []
-        for ip_info in best_ips[:upload_count]:
-            # 构建节点名称：地区名-速度MB/s
-            region_name = ip_info.get('region_name', '未知地区')
-            speed = ip_info['speed']
-            name = f"{region_name}-{speed:.2f}MB/s"
-            
-            batch_data.append({
-                "ip": ip_info['ip'],
-                "port": ip_info['port'],
-                "name": name
-            })
+        batch_data = build_worker_upload_items(best_ips[:upload_count])
         
         # 发送批量POST请求
         try:
@@ -3906,7 +3947,7 @@ def upload_to_github_cli(result_file="result.csv", repo_info=None, github_token=
                         latency_val = latency if latency else 'N/A'
                         
                         # 获取地区中文名称
-                        region_name = '未知地区'
+                        region_name = ''
                         if region_code and region_code in AIRPORT_CODES:
                             region_name = AIRPORT_CODES[region_code].get('name', region_code)
                         elif region_code:
@@ -3918,7 +3959,8 @@ def upload_to_github_cli(result_file="result.csv", repo_info=None, github_token=
                             'speed': speed_val,
                             'latency': latency_val,
                             'region_code': region_code,
-                            'region_name': region_name
+                            'region_name': region_name,
+                            'country': AIRPORT_CODES.get(region_code, {}).get('country', '')
                         })
                     except ValueError:
                         continue
@@ -3933,14 +3975,7 @@ def upload_to_github_cli(result_file="result.csv", repo_info=None, github_token=
         
         # 格式化数据为换行符分隔的格式（包含注释，和Cloudflare Workers API一样）
         print("\n🚀 开始上传到 GitHub 仓库...")
-        content_lines = []
-        for ip_info in best_ips[:upload_count]:
-            # 构建节点名称：地区名-速度MB/s（和Cloudflare Workers API一样）
-            region_name = ip_info.get('region_name', '未知地区')
-            speed = ip_info['speed']
-            name = f"{region_name}-{speed:.2f}MB/s"
-            # 格式：IP:端口#地区名-速度MB/s（井号前后无空格）
-            content_lines.append(f"{ip_info['ip']}:{ip_info['port']}#{name}")
+        content_lines = build_github_upload_lines(best_ips[:upload_count])
         
         # 使用换行符连接所有行
         content = '\n'.join(content_lines)
