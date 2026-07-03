@@ -331,6 +331,20 @@ def probe_https_via_ip(ip, port, host, path, timeout=3.0):
 def build_github_upload_lines(best_ips):
     return [f"{item['ip']}:{item['port']}#{item['name']}" for item in build_worker_upload_items(best_ips)]
 
+# Deploy artifact helpers
+def load_deploy_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    worker_domain = (data.get("workerDomain") or data.get("worker_domain") or "").strip()
+    uuid = (data.get("uuid") or "").strip()
+
+    if not worker_domain or not uuid:
+        raise ValueError("deploy json missing workerDomain/uuid")
+
+    return worker_domain, uuid
+
+
 # Cloudflare IP列表URL和文件
 CLOUDFLARE_IP_URL = "https://www.cloudflare.com/ips-v4/"
 CLOUDFLARE_IP_FILE = "Cloudflare.txt"
@@ -1865,6 +1879,8 @@ def parse_args():
                        help='Worker域名（API上传方式需要）')
     parser.add_argument('--uuid', type=str,
                        help='UUID或路径（API上传方式需要）')
+    parser.add_argument('--deploy-json', type=str,
+                       help='cfnew-deployer 生成的 deploy_result.json 路径（用于自动填充 --worker-domain/--uuid）')
     parser.add_argument('--probe', action='store_true',
                        help='上传前先探测 IP 是否能通过 SNI 访问 worker-domain（推荐开启）')
     parser.add_argument('--probe-timeout', type=float, default=3.0,
@@ -1971,14 +1987,18 @@ def run_with_args(args):
             
             # 处理上传
             if args.upload == 'api':
-                if not args.worker_domain or not args.uuid:
+                worker_domain = args.worker_domain
+                uuid = args.uuid
+                if (not worker_domain or not uuid) and args.deploy_json:
+                    worker_domain, uuid = load_deploy_json(args.deploy_json)
+                if not worker_domain or not uuid:
                     print("❌ API上传需要提供 --worker-domain 和 --uuid 参数")
                 else:
                     # 调用命令行模式的上传函数
                     upload_to_cloudflare_api_cli(
                         "result.csv",
-                        args.worker_domain,
-                        args.uuid,
+                        worker_domain,
+                        uuid,
                         args.upload_count,
                         clear_existing=args.clear,
                         probe=args.probe,
@@ -2072,14 +2092,18 @@ def run_with_args(args):
             
             # 处理上传
             if args.upload == 'api':
-                if not args.worker_domain or not args.uuid:
+                worker_domain = args.worker_domain
+                uuid = args.uuid
+                if (not worker_domain or not uuid) and args.deploy_json:
+                    worker_domain, uuid = load_deploy_json(args.deploy_json)
+                if not worker_domain or not uuid:
                     print("❌ API上传需要提供 --worker-domain 和 --uuid 参数")
                 else:
                     # 调用命令行模式的上传函数
                     upload_to_cloudflare_api_cli(
                         "result.csv",
-                        args.worker_domain,
-                        args.uuid,
+                        worker_domain,
+                        uuid,
                         args.upload_count,
                         clear_existing=args.clear,
                         probe=args.probe,
