@@ -289,6 +289,20 @@ def build_worker_upload_items(best_ips):
     return items
 
 
+def select_unique_best_ips(best_ips, limit=None):
+    unique_rows = []
+    seen = set()
+    for ip_info in best_ips:
+        key = (ip_info.get("ip"), int(ip_info.get("port") or 443))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_rows.append(ip_info)
+        if limit is not None and len(unique_rows) >= limit:
+            break
+    return unique_rows
+
+
 def build_github_upload_lines(best_ips):
     return [f"{item['ip']}:{item['port']}#{item['name']}" for item in build_worker_upload_items(best_ips)]
 
@@ -3069,10 +3083,15 @@ def upload_to_cloudflare_api(result_file="result.csv"):
             except ValueError:
                 print("✗ 请输入有效的数字")
         
+        unique_best_ips = select_unique_best_ips(best_ips, upload_count)
+        skipped_duplicates = max(0, min(upload_count, len(best_ips)) - len(unique_best_ips))
+        if skipped_duplicates > 0:
+            print(f"\nℹ️  上传前按 IP:端口 去重，跳过重复测速结果 {skipped_duplicates} 个")
+
         # 显示将要上报的IP
-        print(f"\n将上报以下 {upload_count} 个优选IP:")
+        print(f"\n将上报以下 {len(unique_best_ips)} 个优选IP:")
         print("-" * 70)
-        for i, ip_info in enumerate(best_ips[:upload_count], 1):
+        for i, ip_info in enumerate(unique_best_ips, 1):
             region_display = f"{ip_info['region_name']}" if ip_info.get('region_name') else '未知地区'
             print(f"  {i:2d}. {ip_info['ip']:15s}:{ip_info['port']:<5d} - {ip_info['speed']:.2f} MB/s - {region_display} - 延迟: {ip_info['latency']}")
         print("-" * 70)
@@ -3116,7 +3135,7 @@ def upload_to_cloudflare_api(result_file="result.csv"):
         
         # 构建批量上报数据
         print("\n🚀 开始批量上报优选IP...")
-        batch_data = build_worker_upload_items(best_ips[:upload_count])
+        batch_data = build_worker_upload_items(unique_best_ips)
         
         # 发送批量POST请求
         use_curl_fallback = False
@@ -3163,12 +3182,12 @@ def upload_to_cloudflare_api(result_file="result.csv"):
                         print(f"   失败: {fail_count} 个")
                 else:
                     print(f"❌ 批量上报失败: {result.get('error', '未知错误')}")
-                    fail_count = upload_count
+                    fail_count = len(unique_best_ips)
             elif response and response.status_code == 403:
                 print(f"❌ 认证失败！请检查：")
                 print(f"   1. UUID或者路径是否正确")
                 print(f"   2. 是否在配置页面开启了 'API管理' 功能")
-                fail_count = upload_count
+                fail_count = len(unique_best_ips)
             elif response:
                 print(f"❌ 批量上报失败 (HTTP {response.status_code})")
                 try:
@@ -3176,20 +3195,20 @@ def upload_to_cloudflare_api(result_file="result.csv"):
                     print(f"   错误详情: {error_detail.get('error', '无详情')}")
                 except:
                     pass
-                fail_count = upload_count
+                fail_count = len(unique_best_ips)
                 
         except requests.exceptions.Timeout:
             print(f"❌ 请求超时，请检查网络连接")
             print(f"   建议：检查网络连接或稍后重试")
-            fail_count = upload_count
+            fail_count = len(unique_best_ips)
         except requests.exceptions.RequestException as e:
             print(f"❌ 网络错误: {e}")
             print(f"   建议：检查网络连接或API地址是否正确")
-            fail_count = upload_count
+            fail_count = len(unique_best_ips)
         except Exception as e:
             print(f"❌ 请求失败: {e}")
             print(f"   建议：检查配置是否正确，或联系技术支持")
-            fail_count = upload_count
+            fail_count = len(unique_best_ips)
         
         # 显示统计信息
         print("\n" + "=" * 70)
@@ -3200,7 +3219,7 @@ def upload_to_cloudflare_api(result_file="result.csv"):
             print(f"  ⚠️  跳过重复: {skipped_count} 个")
         if fail_count > 0:
             print(f"  ❌ 失败: {fail_count} 个")
-        print(f"  📊 总计: {upload_count} 个")
+        print(f"  📊 总计: {len(unique_best_ips)} 个")
         print("=" * 70)
         
         if success_count > 0:
@@ -3428,10 +3447,15 @@ def upload_to_github(result_file="result.csv"):
             except ValueError:
                 print("✗ 请输入有效的数字")
         
+        unique_best_ips = select_unique_best_ips(best_ips, upload_count)
+        skipped_duplicates = max(0, min(upload_count, len(best_ips)) - len(unique_best_ips))
+        if skipped_duplicates > 0:
+            print(f"\nℹ️  上传前按 IP:端口 去重，跳过重复测速结果 {skipped_duplicates} 个")
+
         # 显示将要上传的IP
-        print(f"\n将上传以下 {upload_count} 个优选IP:")
+        print(f"\n将上传以下 {len(unique_best_ips)} 个优选IP:")
         print("-" * 70)
-        for i, ip_info in enumerate(best_ips[:upload_count], 1):
+        for i, ip_info in enumerate(unique_best_ips, 1):
             region_display = f"{ip_info['region_name']}" if ip_info.get('region_name') else '未知地区'
             print(f"  {i:2d}. {ip_info['ip']:15s}:{ip_info['port']:<5d} - {ip_info['speed']:.2f} MB/s - {region_display} - 延迟: {ip_info['latency']}")
         print("-" * 70)
@@ -3444,7 +3468,7 @@ def upload_to_github(result_file="result.csv"):
         
         # 格式化数据为换行符分隔的格式（包含注释，和Cloudflare Workers API一样）
         print("\n🚀 开始上传到 GitHub 仓库...")
-        content_lines = build_github_upload_lines(best_ips[:upload_count])
+        content_lines = build_github_upload_lines(unique_best_ips)
         
         # 使用换行符连接所有行
         content = '\n'.join(content_lines)
@@ -3810,9 +3834,14 @@ def upload_to_cloudflare_api_cli(result_file="result.csv", worker_domain=None, u
             except Exception as e:
                 print(f"⚠️  清空操作失败: {e}，继续尝试添加...")
         
+        unique_best_ips = select_unique_best_ips(best_ips, upload_count)
+        skipped_duplicates = max(0, min(upload_count, len(best_ips)) - len(unique_best_ips))
+        if skipped_duplicates > 0:
+            print(f"\nℹ️  上传前按 IP:端口 去重，跳过重复测速结果 {skipped_duplicates} 个")
+
         # 构建批量上报数据
         print("\n🚀 开始批量上报优选IP...")
-        batch_data = build_worker_upload_items(best_ips[:upload_count])
+        batch_data = build_worker_upload_items(unique_best_ips)
         
         # 发送批量POST请求
         try:
@@ -3852,14 +3881,16 @@ def upload_to_cloudflare_api_cli(result_file="result.csv", worker_domain=None, u
                         print(f"  ⚠️  跳过重复: {skipped_count} 个")
                     if fail_count > 0:
                         print(f"  ❌ 失败: {fail_count} 个")
-                    print(f"  📊 总计: {upload_count} 个")
+                    print(f"  📊 总计: {len(unique_best_ips)} 个")
                     print("=" * 70)
                 else:
                     print(f"❌ 批量上报失败: {result.get('error', '未知错误')}")
+                    fail_count = len(unique_best_ips)
             elif response and response.status_code == 403:
                 print(f"❌ 认证失败！请检查：")
                 print(f"   1. UUID或者路径是否正确")
                 print(f"   2. 是否在配置页面开启了 'API管理' 功能")
+                fail_count = len(unique_best_ips)
             elif response:
                 print(f"❌ 批量上报失败 (HTTP {response.status_code})")
                 try:
@@ -3867,13 +3898,17 @@ def upload_to_cloudflare_api_cli(result_file="result.csv", worker_domain=None, u
                     print(f"   错误详情: {error_detail.get('error', '无详情')}")
                 except:
                     pass
+                fail_count = len(unique_best_ips)
                 
         except requests.exceptions.Timeout:
             print(f"❌ 请求超时，请检查网络连接")
+            fail_count = len(unique_best_ips)
         except requests.exceptions.RequestException as e:
             print(f"❌ 网络错误: {e}")
+            fail_count = len(unique_best_ips)
         except Exception as e:
             print(f"❌ 请求失败: {e}")
+            fail_count = len(unique_best_ips)
         
     except Exception as e:
         print(f"❌ 读取测速结果失败: {e}")
@@ -3973,9 +4008,14 @@ def upload_to_github_cli(result_file="result.csv", repo_info=None, github_token=
         upload_count = min(upload_count, len(best_ips))
         print(f"✅ 找到 {len(best_ips)} 个测速结果，将上传前 {upload_count} 个")
         
+        unique_best_ips = select_unique_best_ips(best_ips, upload_count)
+        skipped_duplicates = max(0, min(upload_count, len(best_ips)) - len(unique_best_ips))
+        if skipped_duplicates > 0:
+            print(f"\nℹ️  上传前按 IP:端口 去重，跳过重复测速结果 {skipped_duplicates} 个")
+
         # 格式化数据为换行符分隔的格式（包含注释，和Cloudflare Workers API一样）
         print("\n🚀 开始上传到 GitHub 仓库...")
-        content_lines = build_github_upload_lines(best_ips[:upload_count])
+        content_lines = build_github_upload_lines(unique_best_ips)
         
         # 使用换行符连接所有行
         content = '\n'.join(content_lines)
@@ -4149,7 +4189,7 @@ def upload_to_github_cli(result_file="result.csv", repo_info=None, github_token=
                 if file_url:
                     print(f"  文件地址: {file_url}")
                 print(f"  原始文件地址: {raw_url}")
-                print(f"  上传数量: {upload_count} 个IP")
+                print(f"  上传数量: {len(unique_best_ips)} 个IP")
                 print("=" * 70)
             elif response and response.status_code == 401:
                 print(f"❌ 认证失败！请检查：")
