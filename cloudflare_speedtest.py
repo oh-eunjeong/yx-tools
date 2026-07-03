@@ -14,6 +14,8 @@ import requests
 import json
 import csv
 import argparse
+import socket
+import ssl
 from pathlib import Path
 from datetime import datetime
 
@@ -301,6 +303,29 @@ def select_unique_best_ips(best_ips, limit=None):
         if limit is not None and len(unique_rows) >= limit:
             break
     return unique_rows
+
+
+def probe_https_via_ip(ip, port, host, path, timeout=3.0):
+    if not host:
+        return False
+    if not path.startswith("/"):
+        path = "/" + (path or "")
+    if not path:
+        path = "/"
+
+    ctx = ssl.create_default_context()
+    with socket.create_connection((ip, int(port)), timeout=timeout) as sock:
+        with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+            req = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                "User-Agent: yx-tools\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            )
+            ssock.sendall(req.encode("utf-8"))
+            data = ssock.recv(64)
+            return bool(data)
 
 
 def build_github_upload_lines(best_ips):
@@ -1840,6 +1865,12 @@ def parse_args():
                        help='Worker域名（API上传方式需要）')
     parser.add_argument('--uuid', type=str,
                        help='UUID或路径（API上传方式需要）')
+    parser.add_argument('--probe', action='store_true',
+                       help='上传前先探测 IP 是否能通过 SNI 访问 worker-domain（推荐开启）')
+    parser.add_argument('--probe-timeout', type=float, default=3.0,
+                       help='探测超时秒数（默认: 3.0）')
+    parser.add_argument('--probe-path', type=str, default='',
+                       help='探测路径（默认: /<uuid>/ ）')
     
     # GitHub参数
     parser.add_argument('--repo', type=str,
@@ -1944,7 +1975,16 @@ def run_with_args(args):
                     print("❌ API上传需要提供 --worker-domain 和 --uuid 参数")
                 else:
                     # 调用命令行模式的上传函数
-                    upload_to_cloudflare_api_cli("result.csv", args.worker_domain, args.uuid, args.upload_count, clear_existing=args.clear)
+                    upload_to_cloudflare_api_cli(
+                        "result.csv",
+                        args.worker_domain,
+                        args.uuid,
+                        args.upload_count,
+                        clear_existing=args.clear,
+                        probe=args.probe,
+                        probe_timeout=args.probe_timeout,
+                        probe_path=args.probe_path,
+                    )
             elif args.upload == 'github':
                 if not args.repo or not args.token:
                     print("❌ GitHub上传需要提供 --repo 和 --token 参数")
@@ -2036,7 +2076,16 @@ def run_with_args(args):
                     print("❌ API上传需要提供 --worker-domain 和 --uuid 参数")
                 else:
                     # 调用命令行模式的上传函数
-                    upload_to_cloudflare_api_cli("result.csv", args.worker_domain, args.uuid, args.upload_count, clear_existing=args.clear)
+                    upload_to_cloudflare_api_cli(
+                        "result.csv",
+                        args.worker_domain,
+                        args.uuid,
+                        args.upload_count,
+                        clear_existing=args.clear,
+                        probe=args.probe,
+                        probe_timeout=args.probe_timeout,
+                        probe_path=args.probe_path,
+                    )
             elif args.upload == 'github':
                 if not args.repo or not args.token:
                     print("❌ GitHub上传需要提供 --repo 和 --token 参数")
@@ -3655,7 +3704,16 @@ def upload_to_github(result_file="result.csv"):
         return None
 
 
-def upload_to_cloudflare_api_cli(result_file="result.csv", worker_domain=None, uuid=None, upload_count=10, clear_existing=False):
+def upload_to_cloudflare_api_cli(
+    result_file="result.csv",
+    worker_domain=None,
+    uuid=None,
+    upload_count=10,
+    clear_existing=False,
+    probe=False,
+    probe_timeout=3.0,
+    probe_path="",
+):
     """命令行模式：上报优选结果到 Cloudflare Workers API
     
     Args:
@@ -3802,6 +3860,33 @@ def upload_to_cloudflare_api_cli(result_file="result.csv", worker_domain=None, u
         # 限制上传数量
         upload_count = min(upload_count, len(best_ips))
         print(f"✅ 找到 {len(best_ips)} 个测速结果，将上传前 {upload_count} 个")
+
+        if probe:
+            path = probe_path.strip() if probe_path else ""
+            if not path:
+                path = f"/{uuid}/"
+            ok = []
+            seen_keys = set()
+            for ip_info in best_ips:
+                key = (ip_info.get("ip"), int(ip_info.get("port") or 443))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                try:
+                    if probe_https_via_ip(ip_info["ip"], ip_info["port"], worker_domain, path, timeout=probe_timeout):
+                        ok.append(ip_info)
+                        if len(ok) >= upload_count:
+                            break
+                except Exception:
+                    continue
+
+            if not ok:
+                print("❌ 探测后未找到可连通的IP（请检查网络/VPN/域名或降低筛选条件）")
+                return
+
+            best_ips = ok
+            upload_count = min(upload_count, len(best_ips))
+            print(f"✅ 探测通过 {len(best_ips)} 个IP，将上传前 {upload_count} 个")
         
         # 如果需要清空，先执行清空操作（在确认有数据可以上报之后）
         if should_clear:
