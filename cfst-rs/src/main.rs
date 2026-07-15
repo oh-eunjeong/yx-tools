@@ -1073,6 +1073,7 @@ async fn probe_vless_tunnel_via_ip(
         tls.flush().await.ok()?;
 
         let mut collected = Vec::new();
+        let mut stripped_vless_prefix = false;
         let deadline = Instant::now() + timeout_duration;
         while Instant::now() < deadline && collected.len() < 64 * 1024 {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1084,6 +1085,10 @@ async fn probe_vless_tunnel_via_ip(
             match frame.opcode {
                 0x1 | 0x2 => {
                     collected.extend_from_slice(&frame.payload);
+                    if !stripped_vless_prefix && collected.len() >= 2 {
+                        collected.drain(..2);
+                        stripped_vless_prefix = true;
+                    }
                     if is_expected_http_probe_response(&collected) {
                         return Some(());
                     }
@@ -1141,11 +1146,11 @@ fn build_vless_http_probe_payload(uuid: &str) -> anyhow::Result<Vec<u8>> {
         anyhow::bail!("uuid must be 32 hex chars after removing hyphens");
     }
     let id = hex_to_bytes(&value)?;
-    let host = "example.com";
+    let host = "connectivitycheck.gstatic.com";
     let host_bytes = host.as_bytes();
     let mut request = Vec::new();
-    request.extend_from_slice(b"GET / HTTP/1.1\r\n");
-    request.extend_from_slice(b"Host: example.com\r\n");
+    request.extend_from_slice(b"GET /generate_204 HTTP/1.1\r\n");
+    request.extend_from_slice(b"Host: connectivitycheck.gstatic.com\r\n");
     request.extend_from_slice(b"User-Agent: yx-tools-probe\r\n");
     request.extend_from_slice(b"Accept: */*\r\n");
     request.extend_from_slice(b"Connection: close\r\n\r\n");
@@ -1188,6 +1193,9 @@ fn is_expected_http_probe_response(data: &[u8]) -> bool {
     };
     let status_line_end = data.windows(2).position(|w| w == b"\r\n").unwrap_or(header_end);
     let status_line = &data[..status_line_end];
+    if status_line.windows(5).any(|w| w == b" 204 ") {
+        return true;
+    }
     if !status_line.windows(5).any(|w| w == b" 200 ") {
         return false;
     }

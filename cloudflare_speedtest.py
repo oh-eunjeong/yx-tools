@@ -322,10 +322,10 @@ def uuid_to_bytes(uuid_str):
 
 def build_vless_http_probe_payload(
     uuid_str,
-    target_host="example.com",
+    target_host="connectivitycheck.gstatic.com",
     target_port=80,
     http_host=None,
-    http_path="/",
+    http_path="/generate_204",
 ):
     host = (target_host or "").strip()
     if not host:
@@ -367,6 +367,8 @@ def is_expected_http_probe_response(data):
     if header_end < 0:
         return False
     status_line = data.split(b"\r\n", 1)[0]
+    if b" 204 " in status_line:
+        return True
     if b" 200 " not in status_line:
         return False
     body = data[header_end + 4:]
@@ -436,10 +438,10 @@ def probe_vless_tunnel_via_ip(ip, port, host, uuid_str, path="", timeout=3.0):
     ).decode("ascii")
     probe_payload = build_vless_http_probe_payload(
         uuid_str=uuid_str,
-        target_host="example.com",
+        target_host="connectivitycheck.gstatic.com",
         target_port=80,
-        http_host="example.com",
-        http_path="/",
+        http_host="connectivitycheck.gstatic.com",
+        http_path="/generate_204",
     )
 
     ctx = ssl.create_default_context()
