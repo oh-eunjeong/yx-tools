@@ -16,6 +16,10 @@ import csv
 import argparse
 import socket
 import ssl
+import base64
+import hashlib
+import re
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -305,44 +309,250 @@ def select_unique_best_ips(best_ips, limit=None):
     return unique_rows
 
 
-def probe_https_via_ip(ip, port, host, path, timeout=3.0):
+def build_default_probe_path():
+    return "/?ed=2048"
+
+
+def uuid_to_bytes(uuid_str):
+    value = (uuid_str or "").strip().replace("-", "")
+    if len(value) != 32:
+        raise ValueError("uuid must be 32 hex chars after removing hyphens")
+    return bytes.fromhex(value)
+
+
+def build_vless_http_probe_payload(
+    uuid_str,
+    target_host="example.com",
+    target_port=80,
+    http_host=None,
+    http_path="/",
+):
+    host = (target_host or "").strip()
     if not host:
+        raise ValueError("target_host is required")
+    if not http_path.startswith("/"):
+        http_path = "/" + http_path
+    http_host = (http_host or host).strip()
+    host_bytes = host.encode("utf-8")
+    if len(host_bytes) > 255:
+        raise ValueError("target_host is too long")
+
+    request_bytes = (
+        f"GET {http_path} HTTP/1.1\r\n"
+        f"Host: {http_host}\r\n"
+        "User-Agent: yx-tools-probe\r\n"
+        "Accept: */*\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    ).encode("utf-8")
+
+    return b"".join([
+        b"\x00",  # version
+        uuid_to_bytes(uuid_str),
+        b"\x00",  # opt len
+        b"\x01",  # tcp
+        int(target_port).to_bytes(2, "big"),
+        b"\x02",  # domain
+        bytes([len(host_bytes)]),
+        host_bytes,
+        request_bytes,
+    ])
+
+
+def is_expected_http_probe_response(data):
+    data = bytes(data or b"")
+    if not data.startswith((b"HTTP/1.1 ", b"HTTP/1.0 ")):
         return False
+    header_end = data.find(b"\r\n\r\n")
+    if header_end < 0:
+        return False
+    status_line = data.split(b"\r\n", 1)[0]
+    if b" 200 " not in status_line:
+        return False
+    body = data[header_end + 4:]
+    return b"Example Domain" in body
+
+
+def build_websocket_client_frame(payload, opcode=0x2):
+    payload = bytes(payload or b"")
+    first_byte = 0x80 | (opcode & 0x0F)
+    payload_len = len(payload)
+    mask_key = os.urandom(4)
+    header = bytearray([first_byte])
+    if payload_len < 126:
+        header.append(0x80 | payload_len)
+    elif payload_len < 65536:
+        header.append(0x80 | 126)
+        header.extend(payload_len.to_bytes(2, "big"))
+    else:
+        header.append(0x80 | 127)
+        header.extend(payload_len.to_bytes(8, "big"))
+    masked_payload = bytes(byte ^ mask_key[index % 4] for index, byte in enumerate(payload))
+    return bytes(header) + mask_key + masked_payload
+
+
+def recv_exact(sock, size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise EOFError("socket closed before enough bytes were received")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def read_websocket_frame(sock):
+    first_two = recv_exact(sock, 2)
+    first_byte, second_byte = first_two
+    fin = bool(first_byte & 0x80)
+    opcode = first_byte & 0x0F
+    masked = bool(second_byte & 0x80)
+    payload_len = second_byte & 0x7F
+
+    if payload_len == 126:
+        payload_len = int.from_bytes(recv_exact(sock, 2), "big")
+    elif payload_len == 127:
+        payload_len = int.from_bytes(recv_exact(sock, 8), "big")
+
+    mask_key = recv_exact(sock, 4) if masked else b""
+    payload = bytearray(recv_exact(sock, payload_len)) if payload_len else bytearray()
+
+    if masked:
+        payload = bytearray(byte ^ mask_key[index % 4] for index, byte in enumerate(payload))
+
+    return fin, opcode, bytes(payload)
+
+
+def probe_vless_tunnel_via_ip(ip, port, host, uuid_str, path="", timeout=3.0):
+    if not host or not uuid_str:
+        return False
+    path = (path or "").strip() or build_default_probe_path()
     if not path.startswith("/"):
-        path = "/" + (path or "")
-    if not path:
-        path = "/"
+        path = "/" + path
+
+    websocket_key = base64.b64encode(os.urandom(16)).decode("ascii")
+    expected_accept = base64.b64encode(
+        hashlib.sha1((websocket_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
+    ).decode("ascii")
+    probe_payload = build_vless_http_probe_payload(
+        uuid_str=uuid_str,
+        target_host="example.com",
+        target_port=80,
+        http_host="example.com",
+        http_path="/",
+    )
 
     ctx = ssl.create_default_context()
     with socket.create_connection((ip, int(port)), timeout=timeout) as sock:
         with ctx.wrap_socket(sock, server_hostname=host) as ssock:
-            req = (
+            ssock.settimeout(timeout)
+            request = (
                 f"GET {path} HTTP/1.1\r\n"
                 f"Host: {host}\r\n"
-                "User-Agent: yx-tools\r\n"
-                "Connection: close\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {websocket_key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n"
+                "User-Agent: yx-tools-probe\r\n"
                 "\r\n"
             )
-            ssock.sendall(req.encode("utf-8"))
-            data = ssock.recv(64)
-            return bool(data)
+            ssock.sendall(request.encode("utf-8"))
+
+            response_head = b""
+            while b"\r\n\r\n" not in response_head and len(response_head) < 8192:
+                chunk = ssock.recv(1024)
+                if not chunk:
+                    return False
+                response_head += chunk
+
+            header_blob, _, _ = response_head.partition(b"\r\n\r\n")
+            header_text = header_blob.decode("utf-8", errors="replace")
+            if " 101 " not in header_text.splitlines()[0]:
+                return False
+            if expected_accept.lower() not in header_text.lower():
+                return False
+
+            ssock.sendall(build_websocket_client_frame(probe_payload, opcode=0x2))
+
+            data_buffer = bytearray()
+            stripped_vless_prefix = False
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                remaining = max(0.1, deadline - time.time())
+                ssock.settimeout(remaining)
+                fin, opcode, payload = read_websocket_frame(ssock)
+                if opcode == 0x8:
+                    return False
+                if opcode == 0x9:
+                    ssock.sendall(build_websocket_client_frame(payload, opcode=0xA))
+                    continue
+                if opcode not in {0x0, 0x1, 0x2}:
+                    continue
+
+                data_buffer.extend(payload)
+                if not stripped_vless_prefix and len(data_buffer) >= 2:
+                    del data_buffer[:2]
+                    stripped_vless_prefix = True
+                if is_expected_http_probe_response(data_buffer):
+                    return True
+            return False
 
 
 def build_github_upload_lines(best_ips):
     return [f"{item['ip']}:{item['port']}#{item['name']}" for item in build_worker_upload_items(best_ips)]
 
 # Deploy artifact helpers
-def load_deploy_json(path):
+def load_deploy_target(path):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    worker_domain = (data.get("workerDomain") or data.get("worker_domain") or "").strip()
+    api_domain = (
+        data.get("apiDomain")
+        or data.get("api_domain")
+        or data.get("workerDomain")
+        or data.get("worker_domain")
+        or ""
+    ).strip()
+    probe_domain = (
+        data.get("probeDomain")
+        or data.get("probe_domain")
+        or data.get("workerDomain")
+        or data.get("worker_domain")
+        or api_domain
+        or ""
+    ).strip()
     uuid = (data.get("uuid") or "").strip()
 
-    if not worker_domain or not uuid:
-        raise ValueError("deploy json missing workerDomain/uuid")
+    if not api_domain or not uuid:
+        raise ValueError("deploy json missing apiDomain/workerDomain and uuid")
 
-    return worker_domain, uuid
+    return {
+        "deploy_type": (data.get("deployType") or data.get("deploy_type") or "").strip(),
+        "api_domain": api_domain,
+        "probe_domain": probe_domain or api_domain,
+        "uuid": uuid,
+    }
+
+
+def ensure_supported_deploy_target(target, *, require_tunnel=False, action="当前操作"):
+    api_domain = (target.get("api_domain") or "").strip().lower()
+    probe_domain = (target.get("probe_domain") or "").strip().lower()
+    deploy_type = (target.get("deploy_type") or "").strip().lower()
+    uses_pages_domain = api_domain.endswith(".pages.dev") or probe_domain.endswith(".pages.dev")
+    if deploy_type == "pages" or uses_pages_domain:
+        if require_tunnel:
+            raise ValueError(
+                f"{action} 不支持 pages.dev 入口：当前 WS+VLESS 严格探测必须使用 Worker 部署，请重新生成 deploy_result.json"
+            )
+        raise ValueError(
+            f"{action} 不支持 pages.dev 入口：请改用 Worker 部署并重新生成 deploy_result.json"
+        )
+
+
+def load_deploy_json(path):
+    target = load_deploy_target(path)
+    ensure_supported_deploy_target(target, action="deploy-json")
+    return target["api_domain"], target["uuid"]
 
 
 # Cloudflare IP列表URL和文件
@@ -353,6 +563,296 @@ CLOUDFLARE_IPV6_FILE = "Cloudflare_ipv6.txt"
 
 # 默认测速URL
 DEFAULT_SPEEDTEST_URL = "https://speed.cloudflare.com/__down?bytes=99999999"
+STAGED_PREFILTER_URL = "https://speed.cloudflare.com/__down?bytes=5000000"
+
+
+def build_download_test_plan(count, final_count=None, mode="staged"):
+    count = max(1, int(count or 1))
+    normalized_mode = (mode or "staged").strip().lower()
+    if normalized_mode not in {"staged", "legacy"}:
+        normalized_mode = "staged"
+
+    if normalized_mode == "legacy":
+        resolved_final_count = count
+        prefilter_count = count
+        prefilter_url = DEFAULT_SPEEDTEST_URL
+    else:
+        prefilter_count = count
+        resolved_final_count = int(final_count or min(count, 50))
+        resolved_final_count = max(1, min(prefilter_count, resolved_final_count))
+        prefilter_url = STAGED_PREFILTER_URL
+
+    return {
+        "mode": normalized_mode,
+        "prefilter_count": prefilter_count,
+        "final_count": resolved_final_count,
+        "prefilter_url": prefilter_url,
+        "final_url": DEFAULT_SPEEDTEST_URL,
+    }
+
+
+def estimate_progress(elapsed_seconds, completed, total):
+    elapsed = max(0.0, float(elapsed_seconds or 0.0))
+    done = max(0, int(completed or 0))
+    overall = max(0, int(total or 0))
+    if done <= 0 or overall <= 0:
+        return {
+            "elapsed_seconds": elapsed,
+            "average_seconds": 0.0,
+            "remaining_seconds": 0.0,
+        }
+
+    average = elapsed / done
+    remaining = max(0, overall - done) * average
+    return {
+        "elapsed_seconds": elapsed,
+        "average_seconds": average,
+        "remaining_seconds": remaining,
+    }
+
+
+def format_duration(seconds):
+    total_seconds = max(0, int(round(float(seconds or 0))))
+    minutes, secs = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minutes}m{secs}s"
+    if minutes:
+        return f"{minutes}m{secs}s"
+    return f"{secs}s"
+
+
+def render_stage_progress(stage_name, completed, total, elapsed_seconds):
+    stats = estimate_progress(elapsed_seconds, completed, total)
+    return (
+        f"{stage_name} {completed}/{total} | "
+        f"已耗时 {format_duration(stats['elapsed_seconds'])} | "
+        f"平均 {stats['average_seconds']:.1f}s/个 | "
+        f"剩余 {format_duration(stats['remaining_seconds'])}"
+    )
+
+
+def parse_speedtest_progress(text):
+    if not text:
+        return None
+    if "[" not in text or "]" not in text:
+        return None
+    match = re.search(r"(\d+)\s*/\s*(\d+)", text)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def build_speedtest_command(exec_name, ip_file, thread, count, speed, delay, url, output_file):
+    if sys.platform == "win32":
+        cmd = [exec_name]
+    else:
+        cmd = [f"./{exec_name}"]
+
+    cmd.extend([
+        "-f", ip_file,
+        "-n", str(thread),
+        "-dn", str(count),
+        "-sl", str(speed),
+        "-tl", str(delay),
+        "-url", url,
+        "-o", output_file,
+    ])
+    return cmd
+
+
+def read_speedtest_results(result_file):
+    best_ips = []
+    with open(result_file, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            ip = (row.get('IP 地址') or '').strip()
+            port = (row.get('端口') or '').strip()
+
+            speed = ''
+            for speed_key in ['下载速度(MB/s)', '下载速度 (MB/s)', '下载速度']:
+                if speed_key in row and row[speed_key] is not None:
+                    speed = str(row[speed_key]).strip()
+                    break
+
+            latency = ''
+            for latency_key in ['平均延迟', '延迟', 'latency']:
+                if latency_key in row and row[latency_key] is not None:
+                    latency = str(row[latency_key]).strip()
+                    break
+
+            region_code = (row.get('地区码') or '').strip()
+
+            if ip and ':' in ip:
+                ip_parts = ip.split(':')
+                if len(ip_parts) == 2:
+                    ip = ip_parts[0]
+                    if not port:
+                        port = ip_parts[1]
+
+            if not port:
+                port = '443'
+
+            if ip:
+                try:
+                    speed_val = float(speed) if speed else 0
+                    latency_val = latency if latency else 'N/A'
+                    region_name = ''
+                    if region_code and region_code in AIRPORT_CODES:
+                        region_name = AIRPORT_CODES[region_code].get('name', region_code)
+                    elif region_code:
+                        region_name = region_code
+
+                    best_ips.append({
+                        'ip': ip,
+                        'port': int(port),
+                        'speed': speed_val,
+                        'latency': latency_val,
+                        'region_code': region_code,
+                        'region_name': region_name,
+                        'country': AIRPORT_CODES.get(region_code, {}).get('country', '')
+                    })
+                except ValueError:
+                    continue
+    return best_ips
+
+
+def write_candidate_ip_file(best_ips, output_file, limit):
+    rows = select_unique_best_ips(best_ips, limit)
+    with open(output_file, 'w', encoding='utf-8') as f:
+        for row in rows:
+            f.write(f"{row['ip']}:{int(row.get('port') or 443)}\n")
+    return len(rows)
+
+
+def run_speedtest_command(cmd, stage_name="测速"):
+    print(f"\n运行命令: {' '.join(cmd)}")
+    print("=" * 50)
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        bufsize=0,
+    )
+
+    output = process.stdout
+    if output is None:
+        return process.wait()
+
+    progress_started_at = None
+    last_was_progress = False
+    buffer = ""
+
+    def flush_frame(frame):
+        nonlocal progress_started_at, last_was_progress
+        text = frame.strip()
+        if not text:
+            return
+        if "开始下载测速" in text and progress_started_at is None:
+            progress_started_at = time.perf_counter()
+        progress = parse_speedtest_progress(text)
+        if progress and progress_started_at is not None:
+            completed, total = progress
+            summary = render_stage_progress(
+                stage_name,
+                completed=completed,
+                total=total,
+                elapsed_seconds=time.perf_counter() - progress_started_at,
+            )
+            print(f"\r{text} | {summary}", end="", flush=True)
+            last_was_progress = True
+            return
+
+        if last_was_progress:
+            print()
+            last_was_progress = False
+        print(text)
+
+    while True:
+        chunk = output.read(1)
+        if chunk == "":
+            if buffer:
+                flush_frame(buffer)
+            elif last_was_progress:
+                print()
+                last_was_progress = False
+            break
+        if chunk in ("\r", "\n"):
+            flush_frame(buffer)
+            buffer = ""
+            continue
+        buffer += chunk
+
+    return process.wait()
+
+
+def run_cli_speedtest(exec_name, ip_file, args, result_file="result.csv"):
+    plan = build_download_test_plan(args.count, args.final_count, args.download_mode)
+    if plan["mode"] == "legacy" or plan["final_count"] >= plan["prefilter_count"]:
+        cmd = build_speedtest_command(
+            exec_name,
+            ip_file,
+            args.thread,
+            plan["final_count"],
+            args.speed,
+            args.delay,
+            plan["final_url"],
+            result_file,
+        )
+        return run_speedtest_command(cmd, stage_name="完整测速")
+
+    prefilter_file = "result_prefilter.csv"
+    candidate_file = "staged_candidates.txt"
+
+    try:
+        print(f"\n[两阶段测速]")
+        print(f"  预筛数量: {plan['prefilter_count']}")
+        print(f"  精测速数量: {plan['final_count']}")
+
+        prefilter_cmd = build_speedtest_command(
+            exec_name,
+            ip_file,
+            args.thread,
+            plan["prefilter_count"],
+            args.speed,
+            args.delay,
+            plan["prefilter_url"],
+            prefilter_file,
+        )
+        prefilter_result = run_speedtest_command(prefilter_cmd, stage_name="预筛")
+        if prefilter_result != 0 or not os.path.exists(prefilter_file):
+            return prefilter_result or 1
+
+        best_ips = read_speedtest_results(prefilter_file)
+        if not best_ips:
+            print("❌ 预筛后未找到有效测速结果")
+            return 1
+
+        candidate_count = write_candidate_ip_file(best_ips, candidate_file, plan["final_count"])
+        if candidate_count <= 0:
+            print("❌ 预筛后未找到可用于精测速的候选IP")
+            return 1
+
+        print(f"✅ 预筛完成，进入完整下载测速的候选IP数: {candidate_count}")
+        final_cmd = build_speedtest_command(
+            exec_name,
+            candidate_file,
+            args.thread,
+            candidate_count,
+            args.speed,
+            args.delay,
+            plan["final_url"],
+            result_file,
+        )
+        return run_speedtest_command(final_cmd, stage_name="精测")
+    finally:
+        for path in [prefilter_file, candidate_file]:
+            if os.path.exists(path):
+                os.remove(path)
 
 # Cloudflare IPv6 地址段（内置）
 # 数据来源：https://www.cloudflare.com/ips-v6/
@@ -1851,6 +2351,8 @@ def parse_args():
     # IP版本
     parser.add_argument('--ipv6', action='store_true',
                        help='使用IPv6（默认使用IPv4）')
+    parser.add_argument('--ip-file', type=str,
+                       help='自定义待测速 IP 列表文件；提供后优先使用，不再自动下载默认 Cloudflare 列表')
     
     # 测试参数
     parser.add_argument('--count', type=int, default=10,
@@ -1861,6 +2363,10 @@ def parse_args():
                        help='延迟上限 ms（默认: 1000）')
     parser.add_argument('--thread', type=int, default=200,
                        help='延迟测速线程数；越多延迟测速越快，性能弱的设备(如路由器)请勿太高（默认: 200, 最多: 1000）')
+    parser.add_argument('--download-mode', choices=['staged', 'legacy'], default='staged',
+                       help='下载测速模式: staged(先轻量预筛再精测，默认) 或 legacy(单阶段完整测速)')
+    parser.add_argument('--final-count', type=int,
+                       help='两阶段测速时，完整下载精测速的目标数量（默认: min(--count, 50)）')
     
     # 常规测速模式参数
     parser.add_argument('--region', type=str,
@@ -1882,11 +2388,13 @@ def parse_args():
     parser.add_argument('--deploy-json', type=str,
                        help='cfnew-deployer 生成的 deploy_result.json 路径（用于自动填充 --worker-domain/--uuid）')
     parser.add_argument('--probe', action='store_true',
-                       help='上传前先探测 IP 是否能通过 SNI 访问 worker-domain（推荐开启）')
+                       help='上传前先做真实 WS+VLESS 隧道探测，只上传真正可代理的 IP（推荐开启）')
     parser.add_argument('--probe-timeout', type=float, default=3.0,
                        help='探测超时秒数（默认: 3.0）')
+    parser.add_argument('--probe-host', type=str,
+                       help='探测时使用的 Host/SNI 域名（默认优先取 deploy_result.json 里的 probeDomain）')
     parser.add_argument('--probe-path', type=str, default='',
-                       help='探测路径（默认: /<uuid>/ ）')
+                       help='探测路径（默认与订阅一致: /?ed=2048）')
     
     # GitHub参数
     parser.add_argument('--repo', type=str,
@@ -1941,6 +2449,10 @@ def run_with_args(args):
     else:
         ip_version, ip_file = "ipv4", CLOUDFLARE_IP_FILE
         print("✓ 已选择: IPv4")
+
+    if args.ip_file:
+        ip_file = args.ip_file
+        print(f"✓ 已使用自定义 IP 文件: {ip_file}")
     
     # 下载或生成 Cloudflare IP 列表
     if not download_cloudflare_ips(ip_version, ip_file):
@@ -1955,42 +2467,38 @@ def run_with_args(args):
         print(f"  速度下限: {args.speed} MB/s")
         print(f"  延迟上限: {args.delay} ms")
         print(f"  延迟测速线程数: {args.thread}")
+        print(f"  下载测速模式: {args.download_mode}")
+        if args.download_mode == 'staged':
+            print(f"  精测速数量: {args.final_count or min(args.count, 50)}")
         
         # 验证线程数
         if args.thread < 1 or args.thread > 1000:
             print(f"❌ 线程数必须在 1-1000 之间，当前值: {args.thread}")
             return 1
         
-        # 构建测速命令
-        if sys.platform == "win32":
-            cmd = [exec_name]
-        else:
-            cmd = [f"./{exec_name}"]
-        
-        cmd.extend([
-            "-f", ip_file,
-            "-n", str(args.thread),
-            "-dn", str(args.count),
-            "-sl", str(args.speed),
-            "-tl", str(args.delay),
-            "-url", DEFAULT_SPEEDTEST_URL,
-            "-o", "result.csv"
-        ])
-        
-        print(f"\n运行命令: {' '.join(cmd)}")
-        print("=" * 50)
-        
-        result = subprocess.run(cmd, encoding='utf-8', errors='replace')
-        
-        if result.returncode == 0:
+        result = run_cli_speedtest(exec_name, ip_file, args, result_file="result.csv")
+
+        if result == 0:
             print("\n✅ 测速完成！结果已保存到 result.csv")
             
             # 处理上传
             if args.upload == 'api':
                 worker_domain = args.worker_domain
                 uuid = args.uuid
-                if (not worker_domain or not uuid) and args.deploy_json:
-                    worker_domain, uuid = load_deploy_json(args.deploy_json)
+                probe_host = (args.probe_host or "").strip()
+                if args.deploy_json:
+                    deploy_target = load_deploy_target(args.deploy_json)
+                    ensure_supported_deploy_target(
+                        deploy_target,
+                        require_tunnel=args.probe,
+                        action="deploy-json 上报"
+                    )
+                    if not worker_domain:
+                        worker_domain = deploy_target["api_domain"]
+                    if not uuid:
+                        uuid = deploy_target["uuid"]
+                    if not probe_host:
+                        probe_host = deploy_target["probe_domain"]
                 if not worker_domain or not uuid:
                     print("❌ API上传需要提供 --worker-domain 和 --uuid 参数")
                 else:
@@ -2003,6 +2511,7 @@ def run_with_args(args):
                         clear_existing=args.clear,
                         probe=args.probe,
                         probe_timeout=args.probe_timeout,
+                        probe_host=probe_host,
                         probe_path=args.probe_path,
                     )
             elif args.upload == 'github':
@@ -2027,6 +2536,9 @@ def run_with_args(args):
         print(f"  速度下限: {args.speed} MB/s")
         print(f"  延迟上限: {args.delay} ms")
         print(f"  延迟测速线程数: {args.thread}")
+        print(f"  下载测速模式: {args.download_mode}")
+        if args.download_mode == 'staged':
+            print(f"  精测速数量: {args.final_count or min(args.count, 50)}")
         
         # 验证线程数
         if args.thread < 1 or args.thread > 1000:
@@ -2062,40 +2574,33 @@ def run_with_args(args):
         
         print(f"找到 {len(region_ips)} 个 {args.region} 地区的IP，开始测速...")
         
-        # 构建测速命令
-        if sys.platform == "win32":
-            cmd = [exec_name]
-        else:
-            cmd = [f"./{exec_name}"]
-        
-        cmd.extend([
-            "-f", region_ip_file,
-            "-n", str(args.thread),
-            "-dn", str(args.count),
-            "-sl", str(args.speed),
-            "-tl", str(args.delay),
-            "-url", DEFAULT_SPEEDTEST_URL,
-            "-o", "result.csv"
-        ])
-        
-        print(f"\n运行命令: {' '.join(cmd)}")
-        print("=" * 50)
-        
-        result = subprocess.run(cmd, encoding='utf-8', errors='replace')
+        result = run_cli_speedtest(exec_name, region_ip_file, args, result_file="result.csv")
         
         # 清理临时文件
         if os.path.exists(region_ip_file):
             os.remove(region_ip_file)
         
-        if result.returncode == 0:
+        if result == 0:
             print("\n✅ 测速完成！结果已保存到 result.csv")
             
             # 处理上传
             if args.upload == 'api':
                 worker_domain = args.worker_domain
                 uuid = args.uuid
-                if (not worker_domain or not uuid) and args.deploy_json:
-                    worker_domain, uuid = load_deploy_json(args.deploy_json)
+                probe_host = (args.probe_host or "").strip()
+                if args.deploy_json:
+                    deploy_target = load_deploy_target(args.deploy_json)
+                    ensure_supported_deploy_target(
+                        deploy_target,
+                        require_tunnel=args.probe,
+                        action="deploy-json 上报"
+                    )
+                    if not worker_domain:
+                        worker_domain = deploy_target["api_domain"]
+                    if not uuid:
+                        uuid = deploy_target["uuid"]
+                    if not probe_host:
+                        probe_host = deploy_target["probe_domain"]
                 if not worker_domain or not uuid:
                     print("❌ API上传需要提供 --worker-domain 和 --uuid 参数")
                 else:
@@ -2108,6 +2613,7 @@ def run_with_args(args):
                         clear_existing=args.clear,
                         probe=args.probe,
                         probe_timeout=args.probe_timeout,
+                        probe_host=probe_host,
                         probe_path=args.probe_path,
                     )
             elif args.upload == 'github':
@@ -3736,6 +4242,7 @@ def upload_to_cloudflare_api_cli(
     clear_existing=False,
     probe=False,
     probe_timeout=3.0,
+    probe_host=None,
     probe_path="",
 ):
     """命令行模式：上报优选结果到 Cloudflare Workers API
@@ -3746,6 +4253,7 @@ def upload_to_cloudflare_api_cli(
         uuid: UUID或路径
         upload_count: 上传IP数量
         clear_existing: 是否清空现有IP（默认: False）
+        probe_host: 探测时使用的 Host/SNI 域名
     """
     print("\n" + "=" * 70)
     print(" 命令行模式：Cloudflare Workers API 上报")
@@ -3888,7 +4396,13 @@ def upload_to_cloudflare_api_cli(
         if probe:
             path = probe_path.strip() if probe_path else ""
             if not path:
-                path = f"/{uuid}/"
+                path = build_default_probe_path()
+            probe_target_host = (probe_host or worker_domain or "").strip()
+            if not probe_target_host:
+                print("❌ 未提供可用于隧道探测的域名（probe host）")
+                return
+            if probe_target_host != worker_domain:
+                print(f"ℹ️  隧道探测将使用单独入口: {probe_target_host}")
             ok = []
             seen_keys = set()
             for ip_info in best_ips:
@@ -3897,7 +4411,14 @@ def upload_to_cloudflare_api_cli(
                     continue
                 seen_keys.add(key)
                 try:
-                    if probe_https_via_ip(ip_info["ip"], ip_info["port"], worker_domain, path, timeout=probe_timeout):
+                    if probe_vless_tunnel_via_ip(
+                        ip_info["ip"],
+                        ip_info["port"],
+                        probe_target_host,
+                        uuid,
+                        path=path,
+                        timeout=probe_timeout,
+                    ):
                         ok.append(ip_info)
                         if len(ok) >= upload_count:
                             break
@@ -3910,7 +4431,7 @@ def upload_to_cloudflare_api_cli(
 
             best_ips = ok
             upload_count = min(upload_count, len(best_ips))
-            print(f"✅ 探测通过 {len(best_ips)} 个IP，将上传前 {upload_count} 个")
+            print(f"✅ 隧道级探测通过 {len(best_ips)} 个IP，将上传前 {upload_count} 个")
         
         # 如果需要清空，先执行清空操作（在确认有数据可以上报之后）
         if should_clear:
