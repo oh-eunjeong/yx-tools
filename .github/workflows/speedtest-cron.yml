@@ -39,6 +39,7 @@ jobs:
           fi
 
           echo "🚀 Starting Cloudflare SpeedTest..."
+          chmod +x CloudflareST*
           python3 cloudflare_speedtest.py \
             --mode beginner \
             --count 10 \
