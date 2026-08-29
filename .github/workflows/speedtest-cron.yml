@@ -25,7 +25,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -r requirements.txt
 
       - name: Run Cloudflare SpeedTest and Upload to cfnew Worker
         env:
@@ -39,7 +39,6 @@ jobs:
           fi
 
           echo "🚀 Starting Cloudflare SpeedTest..."
-          chmod +x CloudflareST*
           python3 cloudflare_speedtest.py \
             --mode beginner \
             --count 10 \
